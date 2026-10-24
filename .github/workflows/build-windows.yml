@@ -1,0 +1,119 @@
+name: Build Windows Portable App
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (Windows x64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12 (x64)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+          cache: "pip"
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      # 仓库里已经放了 ffmpeg.exe/ffprobe.exe 时直接使用；
+      # 没放时自动下载 BtbN 的 static GPL 构建，保证网页上传流程开箱即可构建。
+      - name: Prepare static ffmpeg and ffprobe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ((Test-Path ".\ffmpeg.exe") -and (Test-Path ".\ffprobe.exe")) {
+            Write-Host "Using ffmpeg.exe / ffprobe.exe from repository."
+          } else {
+            $archive = Join-Path $env:RUNNER_TEMP "ffmpeg-win64-gpl.zip"
+            $extract = Join-Path $env:RUNNER_TEMP "ffmpeg-win64-gpl"
+            $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+
+            Write-Host "Downloading static FFmpeg from $url"
+            Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
+            Expand-Archive -Path $archive -DestinationPath $extract -Force
+
+            $ffmpegExe = Get-ChildItem -Path $extract -Recurse -Filter "ffmpeg.exe" |
+              Select-Object -First 1
+            if ($null -eq $ffmpegExe) {
+              throw "Downloaded archive does not contain ffmpeg.exe"
+            }
+            $binDir = $ffmpegExe.DirectoryName
+            Copy-Item (Join-Path $binDir "ffmpeg.exe") ".\ffmpeg.exe" -Force
+            Copy-Item (Join-Path $binDir "ffprobe.exe") ".\ffprobe.exe" -Force
+          }
+
+          & ".\ffmpeg.exe" -hide_banner -version
+          & ".\ffprobe.exe" -hide_banner -version
+
+          # 尽早失败，避免构建出无法烧录字幕的包。
+          $filters = (& ".\ffmpeg.exe" -hide_banner -filters 2>&1) -join "`n"
+          if ($filters -notmatch "\ssubtitles\s") {
+            throw "ffmpeg.exe 缺少 libass 的 subtitles 滤镜，请换 static 完整构建。"
+          }
+          $encoders = (& ".\ffmpeg.exe" -hide_banner -encoders 2>&1) -join "`n"
+          if ($encoders -notmatch "libx264") {
+            throw "ffmpeg.exe 缺少 libx264 编码器，请换带 libx264 的 static 构建。"
+          }
+          $ffmpegHelp = (& ".\ffmpeg.exe" -hide_banner -h full 2>&1) -join "`n"
+          if ($ffmpegHelp -notmatch "fps_mode") {
+            throw "ffmpeg 版本过旧：需要 FFmpeg 5.1+（使用 -fps_mode passthrough）。"
+          }
+
+      # tests/ 作为可选文件：网页上传时若漏掉 tests 文件夹，也不影响打包。
+      - name: Run tests
+        if: ${{ hashFiles('tests/test_core.py') != '' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m unittest discover -s tests -v
+
+      - name: Build with PyInstaller (onedir)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m PyInstaller --noconfirm --clean app.spec
+
+      - name: Verify portable folder layout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $appDir = "dist\字幕烧录工具"
+          $exe = Join-Path $appDir "字幕烧录工具.exe"
+          if (-not (Test-Path $exe)) { throw "Missing: $exe" }
+          if (-not (Test-Path (Join-Path $appDir "ffmpeg.exe"))) {
+            throw "ffmpeg.exe 必须与 exe 位于同一目录（检查 spec 的 contents_directory='.'）"
+          }
+          if (-not (Test-Path (Join-Path $appDir "ffprobe.exe"))) {
+            throw "ffprobe.exe 必须与 exe 位于同一目录（检查 spec 的 contents_directory='.'）"
+          }
+          Get-ChildItem $appDir | Select-Object Name, Length
+          Write-Host "Portable folder verified: $appDir"
+
+      - name: Upload portable folder as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SubtitleBurner-Windows-x64
+          # 上传 dist/ 而不是 dist/字幕烧录工具/，这样解压 artifact 后
+          # 会得到完整的外层文件夹“字幕烧录工具”。
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
