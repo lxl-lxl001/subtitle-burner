@@ -1,0 +1,4 @@
+# 运行期仅依赖 Python 标准库（tkinter）。
+# 以下为构建期依赖，仅在 PyInstaller 打包环境/云端 workflow 中安装。
+
+pyinstaller>=6.10,<7
